@@ -14,8 +14,8 @@ type ChoiceTable struct {
 
 fuzzer.go的main函数为入手点：
 
-1. 先对includedCalls初始化；
-2. 而后构建choicetable；
+1. 通过Corpus和CallPairMap，对includedCalls初始化；
+2. 而后构建choicetable，并enablego；
 3. 而后关注loop和poll两个函数；
 
 ## 关键函数/变量
@@ -95,8 +95,7 @@ func CallPairFromFile(filename string, target *Target) CallPairMap {			// 从jso
 }
 ```
 
-
-
+json格式的文件会在extract_syscall_entry阶段，通过idx(内核版本)和xidx(目标点位)来获取。
 
 ### includedCalls
 
@@ -113,8 +112,12 @@ var includedCalls map[int]map[int]bool
 // manager 端处理这个请求后，会将结果通过第三个参数 &includedCalls 返回。这里的 &includedCalls 是一个指针，所以 manager 可以通过这个指针来修改 includedCalls 的值。
 // 这个调用初始化了 includedCalls 这个 map，它会被填充为 manager 返回的数据结构，即一个嵌套的 map map[int]map[int]bool，表示已经包含的调用对。
 // 如果调用失败，会通过 log.Fatalf 终止程序。
-if err := manager.Call("Manager.Check", r.CheckResult, &includedCalls); err != nil {
-	log.Fatalf("Manager.Check call failed: %v", err)
+func main() {
+	// ...
+	if err := manager.Call("Manager.Check", r.CheckResult, &includedCalls); err != nil {
+		log.Fatalf("Manager.Check call failed: %v", err)
+	}
+	// ...
 }
 ```
 
@@ -123,11 +126,11 @@ if err := manager.Call("Manager.Check", r.CheckResult, &includedCalls); err != n
 ```go
 // serv.targetEnabledSyscalls由a.EnabledCalls转换而来
 func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *map[int]map[int]bool) error {
-    // ...
-    includedCalls := serv.mgr.machineChecked(a, serv.targetEnabledSyscalls)
-    // ...
-    *r = includedCalls
-    return nil
+	// ...
+	includedCalls := serv.mgr.machineChecked(a, serv.targetEnabledSyscalls)
+	// ...
+	*r = includedCalls
+    	return nil
 }
 ```
 
@@ -241,15 +244,124 @@ func (mgr *Manager) loadCorpus() map[int]map[int]bool {
 }
 ```
 
+### BuildChoiceTable
 
+在syz-fuzzer/fuzzer.go的main函数中通过下面代码被初始化：
 
+```go
+type Fuzzer struct {
+	// ...
+	choiceTable       *prog.ChoiceTable
+	// ...
+}
 
+type ChoiceTable struct {
+	target *Target
+	runs   [][]int32
+	calls  []*Syscall
 
+	GoEnable  bool
+	startTime time.Time
+	CallPairSelector												// 后面会详解
+}
 
+func main() {
+	// ...
+	fuzzer.choiceTable = target.BuildChoiceTable(fuzzer.corpus, calls)						// corpus最初为空，calls为系统支持的calls，BuildChoiceTable的过程和syzkaller相同
+	fuzzer.choiceTable.EnableGo(r.CallPairMap, r.RpcCallPairMap, fuzzer.corpus, fuzzer.startTime, r.HitIndex)	// 后面详解
+	// ...
 
+```
 
+### EnableGo
 
-EnableGo
+在prog/direct.go中定义了EnableGo的过程：
+
+```go
+，// 依照CallPairMap(静态)和rpcCallPairMap(动态，包含dist)来对ChoiceTable的CallPairSelector做初始化
+func (ct *ChoiceTable) EnableGo(cpMap CallPairMap, rpcCPMap RpcCallPairMap, corpus []*Prog, startTime time.Time, hitIndex uint32) {
+	cpInfos := make([]CallPairInfo, 0, len(cpMap)*3)						// 初始化 CallPairInfo 列表和infoIdxMap索引映射
+	infoIdxMap := make(map[int]map[int]int, len(cpMap))
+	allPrio := 0
+	for tcall, rcalls := range cpMap {								// 遍历CallPairMap的所有调用对（Tcall → []Rcall）
+		if !ct.Enabled(tcall) {
+			continue
+		}
+		rpcRcallMap, ok1 := rpcCPMap[tcall]
+		tmp := append(rcalls, -1)								// 处理每个Rcall（包括无关联调用 Rcall=-1）
+		rIdxMap := make(map[int]int)
+		for _, rcall := range tmp {
+			if rcall != -1 && !ct.Enabled(rcall) {
+				continue
+			}
+			hasAdd := false
+			if ok1 {
+				if dists2, ok2 := rpcRcallMap[rcall]; ok2 {				// 从 rpcCallPairMap 加载历史距离数据（如有）
+					prio := distance2Prio(calcDistSum(dists2), len(dists2))
+					cpInfos = append(cpInfos, CallPairInfo{
+						Tcall: tcall,
+						Rcall: rcall,
+						Prio:  prio,
+						Dists: dists2,
+					})
+					allPrio += prio
+					hasAdd = true
+				}
+			}
+			if !hasAdd {									// 默认优先级（无历史数据时），有关联prio=1，无关联prio=0
+				prio := 1
+				if rcall == -1 {
+					prio = 0
+				}
+				cpInfos = append(cpInfos, CallPairInfo{
+					Tcall: tcall,
+					Rcall: rcall,
+					Prio:  prio,
+					Dists: make([]uint32, 0, 5),
+				})
+				allPrio += prio
+			}
+			rIdxMap[rcall] = len(cpInfos) - 1
+		}
+		// targetCalls = append(targetCalls, tcall)
+		infoIdxMap[tcall] = rIdxMap
+	}
+	if len(cpInfos) == 0 {
+		panic("all target calls are disabled")
+	}
+
+	ct.GoEnable = true										// 更新ChoiceTable中的CallPairSelector
+	ct.startTime = startTime
+	ct.CallPairSelector.hitIndex = hitIndex
+	ct.CallPairSelector.callPairInfos = cpInfos
+	ct.CallPairSelector.prioSum = allPrio
+	ct.CallPairSelector.infoIdxMap = infoIdxMap
+}
+```
+
+### CallPairSelector
+
+BuildChoiceTable将ChoiceTable的普通内容填写(syzakller)，EnableGo将ChoiceTable的系统调用对内容填写(syzdirect)，即CallPairSelector，定义在prog/direct.go：
+
+```go
+type CallPairSelector struct {
+	hitIndex          uint32
+	prioSum           int
+	lastHitDataUpdate time.Time
+	isUpdated     bool
+	callPairInfos []CallPairInfo
+	infoIdxMap    map[int]map[int]int
+	mu sync.RWMutex
+}
+
+type CallPairInfo struct {
+	Tcall int
+	Rcall int
+	Dists []uint32
+	Prio int
+}
+```
+
 
 HasTcall
 
