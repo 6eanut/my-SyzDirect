@@ -360,8 +360,275 @@ type CallPairInfo struct {
 	Dists []uint32
 	Prio int
 }
+
+// CallPairSelector负责存储和管理调用对及其距离信息，根据距离信息计算每个调用对的优先级，根据优先级随机选择调用对；
+// EnableGo方法从cpMap和rpcCPMap构建调用对信息，计算初始优先级；
+// UpdateCallDistance根据程序中的Tcall和Rcall找到对应的CallPairInfo，将新距离插入到Dists数组中，重新计算优先级
+// SelectorCallPair根据优先级随机选择调用对
+// distance2Prio实现距离到优先级的转换
 ```
 
+下面将分别记录对于CallPairSelector的一些方法：
+
+#### UpdateCallDistance
+
+```go
+// 每个Prog都包含调用对信息和距离
+type Prog struct {
+	Target   *Target
+	Calls    []*Call
+	Comments []string
+	ProgExtra
+}
+
+type ProgExtra struct {
+	Dist  uint32
+	Tcall *Call
+	Rcall *Call
+}
+
+// loop->triageInput->UpdateCallDistance
+// triageInput会多次执行程序以确定信号的稳定性，进行最小化，并将程序加入到语料库中
+// 如果该程序中Tcall和Rcall的距离有效，则会调用UpdateCallDistance来对距离和优先级做更新
+func (selector *CallPairSelector) UpdateCallDistance(p *Prog, dist uint32) {
+	if dist == InvalidDist {
+		return
+	}
+	selector.mu.Lock()
+	defer selector.mu.Unlock()
+	tcallId := p.Tcall.Meta.ID								// 获取程序的Tcall和Rcall
+	rcallId := -1
+	if p.Rcall != nil {
+		rcallId = p.Rcall.Meta.ID
+	}
+	infoIdx := selector.infoIdxMap[tcallId][rcallId]					// 获取Tcall&Rcall的系统调用对信息CallPairInfo
+	info := &selector.callPairInfos[infoIdx]
+	dists := info.Dists
+	idx, shouldRet := locateIndex(dists, dist)						// 定位是否要将新距离插入到距离数组中，以及确定要插入的位置
+	if shouldRet {
+		return
+	}
+	prevDistSum := calcDistSum(dists)
+	if idx == len(dists) {									// 如果新距离应该插入到数组末尾
+		dists = append(dists, dist)
+	} else {
+		if len(dists) >= 5 {
+			dists = dists[:4]							// 如果数组已满(长度>=5)，截断只保留前4个
+		}
+		if idx == 0 {									// 如果新距离应该插入到数组开头
+			right := len(dists) - 1
+			for right >= 0 && 2*dist < dists[right] {				// 数组中的最大元组必须小于等于最小元素的两倍，所以需要筛选掉大于新距离两倍的距离
+				right--
+			}
+			if right >= 0 {
+				dists = append([]uint32{dist}, dists[:right+1]...)
+			} else {
+				dists = []uint32{dist}
+			}
+		} else {									// 对于中间位置的插入
+			tmp := append([]uint32{dist}, dists[idx:]...)
+			dists = append(dists[:idx], tmp...)
+		}
+	}
+	currDistSum := calcDistSum(dists)
+	info.Dists = dists
+	if prevDistSum != currDistSum {								// CallPairInfo的距离数组和变化时，更新优先级
+		selector.prioSum = selector.prioSum - info.Prio
+		info.Prio = distance2Prio(currDistSum, len(info.Dists))
+		selector.prioSum += info.Prio
+		selector.isUpdated = true
+	}
+}
+
+// 在dists中找到dist的位置
+func locateIndex(dists []uint32, dist uint32) (int, bool) {
+	idx := len(dists) - 1
+	for idx >= 0 {										// 找到第一个不大于新距离的元素，停止查找
+		if dists[idx] > dist {
+			idx -= 1
+		} else {
+			break
+		}
+	}
+	idx += 1
+	if idx >= 5 || (len(dists) > 0 && CallPairLimitMulti*dists[0] < dist) {			// 数组已满且新距离较大 或 新距离是原最小距离的两倍以上，则不该加入新距离
+		return idx, true
+	}
+	return idx, false
+}
+
+// 当CallPairInfo的Dists和变化时，更新优先级
+func distance2Prio(distSum uint32, distSize int) int {
+	var prio int
+	dist := float64(distSum) / float64(distSize)						// 计算平均距离，根据平均距离范围采取不同的优先级计算策略
+	if dist < 1000 {									// 小于1000，指数衰减，距离越小，优先级越高
+		prio = int(1000 * math.Exp(dist*(-0.002)))
+	} else {
+		left, right := 0.0, 0.0
+		switch int(dist / 1000) {							// 大于1000，将距离按每1000为一个区间划分
+		case 1:
+			left, right = 135, 48
+		case 2:
+			left, right = 48, 16
+		case 3:
+			left, right = 16, 8
+		case 4:
+			left, right = 8, 4
+		case 5:
+			left, right = 4, 2
+		}
+		if left == right {								// 大于6000，prio为1
+			prio = 1
+		} else {
+			prio = int(left - (left-right)*(float64(int(dist)%1000))/1000.0)	// 线性插值计算
+		}
+	}
+	return prio
+}
+```
+
+#### SelectCallPair
+
+```go
+// loop->GenerateInGo->SelectCallPair
+// loop->Mutate->FixExtraCalls->SelectCallPair
+// 生成或变异程序，都会需要选择系统调用对
+func (selector *CallPairSelector) SelectCallPair(r *rand.Rand) (int, int) {
+	selector.mu.RLock()
+	defer selector.mu.RUnlock()
+	if selector.prioSum == 0 {									// 优先级为0，随机选择，系统调用之间均无关联
+		idx := r.Intn(len(selector.callPairInfos))
+		info := &selector.callPairInfos[idx]
+		return info.Tcall, info.Rcall
+	}
+	randVal := r.Intn(selector.prioSum)
+	for i := range selector.callPairInfos {								// 累积优先级加权选择
+		info := &selector.callPairInfos[i]
+		if info.Prio > randVal {
+			return info.Tcall, info.Rcall
+		}
+		randVal -= info.Prio
+	}
+	log.Fatalf("what ??????")
+	return -1, -1
+}
+
+// 下面分别说明生成和变异两种情况
+
+// 生成
+// 在loop中，当语料库为空 或 完成一个周期时，会调用GenerateInGo生成测试程序
+func (target *Target) GenerateInGo(rs rand.Source, ncalls int, ct *ChoiceTable) *Prog {
+	if !ct.GoEnable {
+		return target.Generate(rs, ncalls, ct)
+	}
+	tcallId, rcallId := ct.SelectCallPair(rand.New(rs))						// 选择一个调用对
+	// log.Printf("tcall id: %v, rcall id: %v\n", tcallId, rcallId)
+	return target.generateHelper(ct, rs, ncalls, tcallId, rcallId)					// generateHelper会根据调用对生成程序
+}
+
+func (target *Target) generateHelper(ct *ChoiceTable, rs rand.Source, ncalls, tcallId, rcallId int) *Prog {
+	var rcall *Call
+	s := newState(target, ct, nil)
+	r := newRand(target, rs)
+	p := &Prog{											// 初始化Prog p
+		Target: target,
+		ProgExtra: ProgExtra{
+			Dist: InvalidDist,
+		},
+	}
+
+	if rcallId != -1 {										// 处理Rcall，后续会说明generateParticularCall
+		rcalls := r.generateParticularCall(s, target.Syscalls[rcallId])
+		for _, c := range rcalls {
+			s.analyze(c)
+			p.Calls = append(p.Calls, c)
+		}
+		rcall = rcalls[len(rcalls)-1]
+	}
+
+	for len(p.Calls) < ncalls-1 {									// 填充中间调用，后续会说明generateCall
+		calls := r.generateCall(s, p, len(p.Calls))
+		for _, c := range calls {
+			s.analyze(c)
+			p.Calls = append(p.Calls, c)
+		}
+	}
+
+	r.rcall = rcall
+	targetCalls := r.generateParticularCall(s, r.target.Syscalls[tcallId])				// 处理Tcall
+	p.Rcall = rcall
+	p.Tcall = targetCalls[len(targetCalls)-1]
+
+	rmIdx := len(p.Calls) - 1
+	if rmIdx < 0 {
+		rmIdx = 0
+	}
+	p.Calls = append(p.Calls, targetCalls...)
+	for len(p.Calls) > ncalls {									// 调整程序长度
+		isSucc := p.RemoveCall(rmIdx)
+		if !isSucc && rmIdx == 0 {
+			rmIdx = 1
+		} else if rmIdx > 0 {
+			rmIdx--
+		}
+	}
+	return p
+}
+
+// 变异
+// 当程序需要变异时，变异之后的程序的调用对信息可能被破坏，这时需要对程序p修复，故用到了SelectCallPair
+func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Prog) {
+	r := newRand(p.Target, rs)									// 初始化
+	if ncalls < len(p.Calls) {
+		ncalls = len(p.Calls)
+	}
+	ctx := &mutator{
+		p:      p,
+		r:      r,
+		ncalls: ncalls,
+		ct:     ct,
+		corpus: corpus,
+	}
+	for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(3) {		// 执行变异操作
+		switch {
+		case r.oneOf(5):
+			// Not all calls have anything squashable,
+			// so this has lower priority in reality.
+			ok = ctx.squashAny()								// 尝试压缩复杂指针
+		case r.nOutOf(1, 100):
+			ok = ctx.splice()								// 程序拼接
+		case r.nOutOf(20, 31):
+			x := float64(time.Since(ct.startTime) / time.Minute)				// 随时间变化的混合变异策略
+			y0 := math.Pow(20, x/(-50)) / 2
+			y1 := y0 + 0.5
+			y2 := -y0 + 1.0
+			if y1 > r.Float64() {
+				rcallIdx := getCallIndexByPtr(ctx.p.Rcall, ctx.p.Calls)
+				if rcallIdx != -1 && r.oneOf(2) {
+					ok = ctx.mutateArg(rcallIdx)
+				} else {
+					ok = ctx.mutateArg(getCallIndexByPtr(ctx.p.Tcall, ctx.p.Calls))
+				}
+			}
+			if y2 > r.Float64() {
+				ok = ok || ctx.insertCall()
+			}
+		case r.nOutOf(10, 11):
+			ok = ctx.mutateArg(-1)								// 随机变异参数
+		default:
+			ok = ctx.removeCall()								// 移除随机调用
+		}
+	}
+	if p.Tcall == nil {
+		p.Target.FixExtraCalls(p, r.Rand, ct, RecommendedCalls, nil)				// 如果变异破坏了目标调用对关系，调用FixExtraCalls修复，该函数和generateHelper类似
+	}
+	p.sanitizeFix()											// 确保程序结构有效
+	p.debugValidate()										// 验证
+	if got := len(p.Calls); got < 1 || got > ncalls {
+		panic(fmt.Sprintf("bad number of calls after mutation: %v, want [1, %v]", got, ncalls))
+	}
+}
+```
 
 HasTcall
 
@@ -370,3 +637,7 @@ generateCandidateInputInGo
 loop
 
 poll
+
+generateParticularCall
+
+generateCall
