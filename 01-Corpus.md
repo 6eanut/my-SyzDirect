@@ -1,5 +1,16 @@
 # Corpus
 
+```go
+type Fuzzer struct {
+	// ...
+	corpusMu     sync.RWMutex
+	corpus       []*prog.Prog
+	corpusHashes map[hash.Sig]struct{}
+	distanceGroup map[uint32]uint32 // distance -> # program in this distance
+	// ...
+}
+```
+
 Corpus的内容：由多个Prog组成，并且记录了Prog们到目标位置距离的分布；
 
 Corpus的作用：Corpus是syzDirect生成的一组Prog，这组Prog是当前能够覆盖内核的最大范围的一组Prog。

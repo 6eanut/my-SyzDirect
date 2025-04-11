@@ -10,6 +10,23 @@ type ChoiceTable struct {
 	startTime time.Time
 	CallPairSelector
 }
+
+type CallPairSelector struct {
+	hitIndex          uint32
+	prioSum           int
+	lastHitDataUpdate time.Time
+	isUpdated     bool
+	callPairInfos []CallPairInfo		// 关键
+	infoIdxMap    map[int]map[int]int	// 索引
+	mu sync.RWMutex
+}
+
+type CallPairInfo struct {
+	Tcall int
+	Rcall int
+	Dists []uint32
+	Prio int
+}
 ```
 
 fuzzer.go的main函数为入手点：
@@ -18,9 +35,66 @@ fuzzer.go的main函数为入手点：
 2. 而后构建choicetable，并enablego；
 3. 而后关注loop和poll两个函数；
 
-## 关键函数/变量
+## 1 优先级定义
 
-### CallPairMap
+基于距离的优先级：
+
+* 调用对的优先级由历史距离数据（`Dists []uint32`）计算：
+
+  ```go
+  func distance2Prio(distSum uint32, distSize int) int {
+      avgDist := float64(distSum) / float64(distSize)
+      if avgDist < 1000 {
+          return int(1000 * math.Exp(avgDist*(-0.002)))  // 指数衰减
+      } else {
+          return linearInterpolation(avgDist)  // 线性插值
+      }
+  }
+  ```
+* 越小越优先：平均距离越小，优先级越高。
+
+## 2 更新策略
+
+### 2-1 初始化
+
+* 从 `CallPairMap` 和 `RpcCallPairMap` 加载调用对。
+* 默认优先级：
+  * 有关联调用（`Rcall != -1`）：`prio = 1`。
+  * 无关联调用（`Rcall = -1`）：`prio = 0`
+
+### 2-2 动态更新
+
+* 触发条件：程序执行后，`triageInput` 调用 `UpdateCallDistance`。
+* 更新逻辑：
+  1. 插入新距离到 `Dists` 数组（最多保留 5 个最小距离）。
+  2. 重新计算优先级：
+
+```go
+prevPrio := info.Prio
+newPrio := distance2Prio(calcDistSum(dists), len(dists))
+selector.prioSum += (newPrio - prevPrio)
+```
+
+## 3 选择策略
+
+`SelectCallPair`：
+
+1. 如果 `prioSum == 0`，随机选择调用对。
+2. 否则按优先级加权随机选择：
+
+```go
+randVal := r.Intn(selector.prioSum)
+for _, info := range selector.callPairInfos {
+    if info.Prio > randVal {
+        return info.Tcall, info.Rcall
+    }
+    randVal -= info.Prio
+}
+```
+
+## 4 关键函数/变量
+
+### 4-1 CallPairMap
 
 含义：Target-Relates Call Pairs，Tcall ID->Rcall IDs
 
@@ -97,7 +171,7 @@ func CallPairFromFile(filename string, target *Target) CallPairMap {			// 从jso
 
 json格式的文件会在extract_syscall_entry阶段，通过idx(内核版本)和xidx(目标点位)来获取。
 
-### includedCalls
+### 4-2 includedCalls
 
 含义：Tcall->Rcall->included
 
@@ -244,7 +318,7 @@ func (mgr *Manager) loadCorpus() map[int]map[int]bool {
 }
 ```
 
-### BuildChoiceTable
+### 4-3 BuildChoiceTable
 
 在syz-fuzzer/fuzzer.go的main函数中通过下面代码被初始化：
 
@@ -273,7 +347,7 @@ func main() {
 
 ```
 
-### EnableGo
+### 4-4 EnableGo
 
 在prog/direct.go中定义了EnableGo的过程：
 
@@ -339,7 +413,7 @@ func (ct *ChoiceTable) EnableGo(cpMap CallPairMap, rpcCPMap RpcCallPairMap, corp
 }
 ```
 
-### CallPairSelector
+### 4-5 CallPairSelector
 
 BuildChoiceTable将ChoiceTable的普通内容填写(syzakller)，EnableGo将ChoiceTable的系统调用对内容填写(syzdirect)，即CallPairSelector，定义在prog/direct.go：
 
@@ -349,8 +423,8 @@ type CallPairSelector struct {
 	prioSum           int
 	lastHitDataUpdate time.Time
 	isUpdated     bool
-	callPairInfos []CallPairInfo
-	infoIdxMap    map[int]map[int]int
+	callPairInfos []CallPairInfo		// 关键
+	infoIdxMap    map[int]map[int]int	// 索引
 	mu sync.RWMutex
 }
 
@@ -370,7 +444,7 @@ type CallPairInfo struct {
 
 下面将分别记录对于CallPairSelector的一些方法：
 
-#### UpdateCallDistance
+#### 4-5-1 UpdateCallDistance
 
 ```go
 // 每个Prog都包含调用对信息和距离
@@ -487,7 +561,7 @@ func distance2Prio(distSum uint32, distSize int) int {
 }
 ```
 
-#### SelectCallPair
+#### 4-5-2 SelectCallPair
 
 ```go
 // loop->GenerateInGo->SelectCallPair
@@ -630,14 +704,158 @@ func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Pro
 }
 ```
 
-HasTcall
+### 4-6 HasTcall
 
-generateCandidateInputInGo
+当语料库不为空时，HasTcall会遍历语料库中的每一个程序，然后表注Tcall和Rcall。
 
-loop
+Tcall是从后向前遍历call，遇到的第一个Tcall；Rcall是从前向后遍历call，遇到的第一个Rcall。
 
-poll
+```go
+func (p *Prog) HasTcall(ct *ChoiceTable) bool {
+	if p.Tcall != nil {
+		return true
+	}
+	for i := len(p.Calls) - 1; i >= 0; i-- {
+		if rcallMap, ok := ct.infoIdxMap[p.Calls[i].Meta.ID]; ok {
+			p.Tcall = p.Calls[i]
+			p.Rcall = nil
+			for j := 0; j < i; j++ {
+				if _, ok = rcallMap[p.Calls[j].Meta.ID]; ok {
+					p.Rcall = p.Calls[j]
+					break
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+```
 
-generateParticularCall
+### 4-7 generateCandidateInputInGo
 
-generateCall
+根据includedCalls来生成candidates，只包含Tcall或Rcall+Tcall。
+
+```go
+func (fuzzer *Fuzzer) generateCandidateInputInGo(includedCalls map[int]map[int]bool) {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	progs := fuzzer.target.MultiGenerateInGo(rnd, fuzzer.choiceTable, includedCalls)
+	for _, p := range progs {
+		fuzzer.workQueue.enqueue(&WorkCandidate{
+			p:     p,
+			flags: ProgCandidate,
+		})
+	}
+}
+
+func (target *Target) MultiGenerateInGo(rs rand.Source, ct *ChoiceTable, includedCalls map[int]map[int]bool) []*Prog {
+	progs := make([]*Prog, 0, len(ct.callPairInfos)*CallPairInitNum)
+	for i := 0; i < CallPairInitNum; i++ {
+		for j := 0; j < len(ct.callPairInfos); j++ {
+			inf := &ct.callPairInfos[j]
+			if len(ct.infoIdxMap[inf.Tcall]) > 1 && inf.Rcall == -1 {
+				continue
+			}
+			if rcallMap, ok := includedCalls[inf.Tcall]; ok && (inf.Rcall == -1 || rcallMap[inf.Rcall]) {
+				continue
+			}
+			ncalls := 2
+			if inf.Rcall == -1 {
+				ncalls = 1
+			}
+			progs = append(progs, target.generateHelper(ct, rs, ncalls, inf.Tcall, inf.Rcall))
+		}
+	}
+	return progs
+}
+```
+
+### 4-8 loop
+
+负责fuzzing，不断从工作队列中获取任务并执行。
+
+1. 从工作队列取出一个任务（Triage 或 Candidate）→ 处理它。
+2. 如果没有任务：
+   - 生成全新程序 → 执行（`GenerateInGo` + `executeAndCollide`）。
+   - 或从语料库选择程序 → 变异 → 执行（`chooseProgram` + `Mutate` + `executeAndCollide`）。
+3. 执行过程中若发现新信号 → 生成新的 `WorkTriage` 任务加入队列。
+
+```go
+func (proc *Proc) loop() {
+	generatePeriod := 100									// 每 100 次循环生成一个新程序
+	if proc.fuzzer.config.Flags&ipc.FlagSignal == 0 {
+		// If we don't have real coverage signal, generate programs more frequently
+		// because fallback signal is weak.
+		generatePeriod = 2
+	}
+	for i := 0; ; i++ {
+		item := proc.fuzzer.workQueue.dequeue()
+		if item != nil {
+			switch item := item.(type) {
+			case *WorkTriage:							// 处理新发现的信号
+				proc.triageInput(item)
+			case *WorkCandidate:
+				item.p.HasTcall(proc.fuzzer.choiceTable)
+				proc.execute(proc.execOpts, item.p, item.flags, StatCandidate)	// 处理候选程序
+			case *WorkSmash:
+				proc.smashInput(item)						// 暴力变异
+			default:
+				log.Fatalf("unknown work type: %#v", item)
+			}
+			continue
+		}
+
+		ct := proc.fuzzer.choiceTable
+		fuzzerSnapshot := proc.fuzzer.snapshot()
+		if len(fuzzerSnapshot.corpus) == 0 || i%generatePeriod == 0 {			// 生成新程序
+			// Generate a new prog.
+			p := proc.fuzzer.target.GenerateInGo(proc.rnd, prog.RecommendedCalls, ct)
+			log.Logf(1, "#%v: generated", proc.pid)
+			proc.executeAndCollide(proc.execOpts, p, ProgNormal, StatGenerate)
+		} else {									// 对程序进行变异
+			// Mutate an existing prog.
+			p := fuzzerSnapshot.chooseProgram(proc.rnd, proc.fuzzer.choiceTable).Clone()
+			p.Mutate(proc.rnd, prog.RecommendedCalls, ct, fuzzerSnapshot.corpus)
+			log.Logf(1, "#%v: mutated", proc.pid)
+			proc.executeAndCollide(proc.execOpts, p, ProgNormal, StatFuzz)
+		}
+	}
+}
+```
+
+### 4-9 poll
+
+负责和Manager通信
+
+```go
+func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
+	tqs, sqs, cqs := fuzzer.workQueue.getSize()
+	a := &rpctype.PollArgs{
+		Name:               fuzzer.name,
+		NeedCandidates:     needCandidates,
+		MaxSignal:          fuzzer.grabNewSignal().Serialize(),
+		Stats:              stats,
+		TriageQueueSize:    tqs,
+		SmashQueueSize:     sqs,
+		CandidateQueueSize: cqs,
+	}
+	r := &rpctype.PollRes{}
+	if err := fuzzer.manager.Call("Manager.Poll", a, r); err != nil {
+		log.Fatalf("Manager.Poll call failed: %v", err)
+	}
+	maxSignal := r.MaxSignal.Deserialize()
+	log.Logf(1, "poll: candidates=%v inputs=%v signal=%v",
+		len(r.Candidates), len(r.NewInputs), maxSignal.Len())
+	fuzzer.addMaxSignal(maxSignal)
+	for _, inp := range r.NewInputs {			// 获取inputs
+		fuzzer.addInputFromAnotherFuzzer(inp)
+	}
+	for _, candidate := range r.Candidates {		// 获取candidate
+		fuzzer.addCandidateInput(candidate)
+	}
+	if needCandidates && len(r.Candidates) == 0 && atomic.LoadUint32(&fuzzer.triagedCandidates) == 0 {
+		atomic.StoreUint32(&fuzzer.triagedCandidates, 1)
+	}
+	return len(r.NewInputs) != 0 || len(r.Candidates) != 0 || maxSignal.Len() != 0
+}
+```
